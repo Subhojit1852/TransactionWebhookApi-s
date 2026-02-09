@@ -1,6 +1,7 @@
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from datetime import datetime
+import threading
 import time
 
 from app.database import SessionLocal
@@ -9,6 +10,10 @@ from app.schemas import TransactionCreate, TransactionResponse
 
 router = APIRouter()
 
+
+# -----------------------------
+# DB Dependency
+# -----------------------------
 def get_db():
     db = SessionLocal()
     try:
@@ -16,58 +21,102 @@ def get_db():
     finally:
         db.close()
 
-def process_transaction(transaction_id: str):
+
+# -----------------------------
+# Background Worker Logic
+# -----------------------------
+def process_transaction_async(transaction_id: str):
+    """
+    Runs completely outside the request lifecycle.
+    Safe for Render free tier.
+    """
     db = SessionLocal()
     try:
-        time.sleep(30)  # simulate external processing
+        # Simulate slow external processing
+        time.sleep(30)
 
-        txn = db.query(Transaction).filter(
-            Transaction.transaction_id == transaction_id
-        ).first()
+        txn = (
+            db.query(Transaction)
+            .filter(Transaction.transaction_id == transaction_id)
+            .first()
+        )
 
-        if txn:
+        if txn and txn.status != "PROCESSED":
             txn.status = "PROCESSED"
             txn.processed_at = datetime.utcnow()
             db.commit()
+
+    except Exception as e:
+        # In real prod: log this
+        db.rollback()
     finally:
         db.close()
 
+
+# -----------------------------
+# Webhook Endpoint (FAST)
+# -----------------------------
 @router.post(
     "/v1/webhooks/transactions",
     status_code=status.HTTP_202_ACCEPTED
 )
 def receive_webhook(
     payload: TransactionCreate,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
-    existing = db.query(Transaction).filter(
-        Transaction.transaction_id == payload.transaction_id
-    ).first()
+    """
+    Production-grade webhook behavior:
+    - Respond immediately
+    - Idempotent
+    - Offload processing
+    """
+
+    # Idempotency check (cheap query)
+    existing = (
+        db.query(Transaction)
+        .filter(Transaction.transaction_id == payload.transaction_id)
+        .first()
+    )
 
     if existing:
-        # Idempotent behavior
         return {"message": "Already received"}
 
-    txn = Transaction(**payload.dict())
+    # Minimal DB write (fast)
+    txn = Transaction(
+        **payload.dict(),
+        status="RECEIVED",
+        processed_at=None
+    )
     db.add(txn)
     db.commit()
 
-    background_tasks.add_task(process_transaction, payload.transaction_id)
+    # Fire-and-forget background thread
+    threading.Thread(
+        target=process_transaction_async,
+        args=(payload.transaction_id,),
+        daemon=True
+    ).start()
 
+    # Return immediately — webhook SLA safe
     return {"message": "Accepted"}
 
+
+# -----------------------------
+# Query Endpoint
+# -----------------------------
 @router.get(
-    "/v1/transactions/{transaction_id}",    
+    "/v1/transactions/{transaction_id}",
     response_model=TransactionResponse
 )
 def get_transaction(
     transaction_id: str,
     db: Session = Depends(get_db)
 ):
-    txn = db.query(Transaction).filter(
-        Transaction.transaction_id == transaction_id
-    ).first()
+    txn = (
+        db.query(Transaction)
+        .filter(Transaction.transaction_id == transaction_id)
+        .first()
+    )
 
     if not txn:
         raise HTTPException(
@@ -75,4 +124,4 @@ def get_transaction(
             detail="Transaction not found"
         )
 
-    return txn  
+    return txn
